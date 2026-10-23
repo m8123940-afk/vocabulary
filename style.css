@@ -1,0 +1,43 @@
+"""Проверка initData из Telegram Mini App (подпись HMAC по токену бота).
+
+Документация Telegram: данные подписаны ключом, полученным из токена бота:
+secret = HMAC_SHA256(key="WebAppData", msg=bot_token), hash = HMAC_SHA256(secret, data_check_string).
+"""
+import hashlib
+import hmac
+import json
+import time
+from urllib.parse import parse_qsl
+
+MAX_AGE_SECONDS = 24 * 3600
+
+
+class AuthError(Exception):
+    pass
+
+
+def verify_init_data(init_data: str, bot_token: str, max_age: int = MAX_AGE_SECONDS, now: int | None = None) -> int:
+    """Возвращает Telegram user id, если подпись верна и данные не устарели."""
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    received = pairs.pop("hash", None)
+    if not received:
+        raise AuthError("В данных нет подписи")
+    data_check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    expected = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, received):
+        raise AuthError("Подпись не совпадает")
+    now = int(time.time()) if now is None else now
+    try:
+        auth_date = int(pairs.get("auth_date", "0"))
+    except ValueError as exc:
+        raise AuthError("Некорректная дата") from exc
+    if now - auth_date > max_age:
+        raise AuthError("Данные устарели — откройте приложение заново")
+    try:
+        user_id = json.loads(pairs.get("user", "{}")).get("id")
+    except (json.JSONDecodeError, AttributeError) as exc:
+        raise AuthError("Нет данных пользователя") from exc
+    if not isinstance(user_id, int):
+        raise AuthError("Нет данных пользователя")
+    return user_id

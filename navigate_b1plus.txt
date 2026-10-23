@@ -1,0 +1,108 @@
+"""Логика тренировки: выбор слов, проверка ответа, прогресс и завершение."""
+import random
+from dataclasses import dataclass
+
+from bot.answer_check import is_answer_correct
+from bot.db import Database, Word
+
+ALL_PARTS = "*"  # значение Part, означающее «все части Unit»
+
+
+@dataclass
+class AnswerResult:
+    correct: bool
+    skipped: bool
+    word: Word
+    said: str
+    done: int
+    total: int
+
+
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    filled = round(width * done / total) if total else 0
+    return "▓" * filled + "░" * (width - filled) + f"  {done}/{total}"
+
+
+def start_training(
+    db: Database,
+    user_id: int,
+    unit: str,
+    part: str,
+    mode: str = "train",
+    word_ids: list[int] | None = None,
+) -> int:
+    settings = db.get_settings(user_id)
+    if word_ids is None:
+        part_filter = None if part == ALL_PARTS else part
+        words = db.list_words(user_id, unit=unit, part=part_filter)
+        ids = [w.id for w in words]
+        if settings["shuffle"]:
+            random.shuffle(ids)
+        word_ids = ids[: settings["words_per_session"]]
+    if not word_ids:
+        raise ValueError("Нет слов для тренировки. Загрузите слова или добавьте их вручную.")
+    session_id = db.create_session(user_id, unit, part, list(word_ids), mode=mode)
+    db.set_active_session(user_id, session_id)
+    return session_id
+
+
+def current_word(db: Database, user_id: int, session_id: int) -> Word | None:
+    session = db.get_session(user_id, session_id)
+    if session is None or session.current_index >= len(session.word_ids):
+        return None
+    return db.get_word(user_id, session.word_ids[session.current_index])
+
+
+def _advance(db: Database, user_id: int, session_id: int, word: Word, correct: bool, skipped: bool, said: str) -> AnswerResult:
+    session = db.get_session(user_id, session_id)
+    db.record_attempt(session_id, word.id, correct=correct, skipped=skipped, errors=0 if correct else 1)
+    db.set_current_index(session_id, session.current_index + 1)
+    return AnswerResult(correct, skipped, word, said, session.current_index + 1, len(session.word_ids))
+
+
+def submit_answer(db: Database, user_id: int, session_id: int, answer: str) -> AnswerResult:
+    word = current_word(db, user_id, session_id)
+    if word is None:
+        raise ValueError("Тренировка уже завершена.")
+    return _advance(db, user_id, session_id, word, is_answer_correct(answer, word.ru), False, answer)
+
+
+def skip_word(db: Database, user_id: int, session_id: int) -> AnswerResult:
+    word = current_word(db, user_id, session_id)
+    if word is None:
+        raise ValueError("Тренировка уже завершена.")
+    # Пропуск считается ошибкой для баллов, но в статистике отмечается отдельно.
+    return _advance(db, user_id, session_id, word, False, True, "")
+
+
+def is_finished(db: Database, user_id: int, session_id: int) -> bool:
+    session = db.get_session(user_id, session_id)
+    return session.current_index >= len(session.word_ids)
+
+
+def finish(db: Database, user_id: int, session_id: int) -> dict:
+    """Завершает тренировку, начисляет баллы (один раз) и возвращает итоги."""
+    session = db.get_session(user_id, session_id)
+    attempts = db.session_attempts(session_id)
+    total = len(session.word_ids)
+    done = len(attempts)
+    skipped = sum(1 for a in attempts if a["skipped"])
+    correct = sum(1 for a in attempts if a["correct"] and not a["skipped"])
+    errors = sum(1 for a in attempts if a["errors"] > 0 and not a["skipped"])
+    awarded = db.finish_session(user_id, session_id)
+    db.set_active_session(user_id, None)
+    return {
+        "session_id": session_id,
+        "mode": session.mode,
+        "unit": session.unit,
+        "part": session.part,
+        "total": total,
+        "done": done,
+        "correct": correct,
+        "errors": errors,
+        "skipped": skipped,
+        "percent": round(100 * correct / total) if total else 0,
+        "points": awarded,
+        "balance": db.balance(user_id),
+        "wrong_ids": db.wrong_word_ids(session_id),
+    }

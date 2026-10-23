@@ -1,0 +1,33 @@
+import asyncio
+
+import pytest
+
+from bot import speech
+
+
+def test_without_key_recognizer_is_unavailable():
+    rec = speech.build_recognizer("none", None)
+    with pytest.raises(speech.SpeechUnavailable):
+        asyncio.run(rec.transcribe(b"x", "a.ogg"))
+
+
+def test_openai_provider_requires_key():
+    assert isinstance(speech.build_recognizer("openai", "sk-test"), speech.WhisperRecognizer)
+    assert isinstance(speech.build_recognizer("openai", None), speech.NoRecognizer)
+
+
+def test_tts_failure_returns_none(monkeypatch):
+    def boom(text, slow):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(speech, "_synthesize_sync", boom)
+    assert asyncio.run(speech.synthesize("cat")) is None
+
+
+def test_tts_success_passes_speed(monkeypatch):
+    seen = {}
+    def fake(text, slow):
+        seen["slow"] = slow
+        return b"mp3"
+    monkeypatch.setattr(speech, "_synthesize_sync", fake)
+    assert asyncio.run(speech.synthesize("cat", 0.7)) == b"mp3"
+    assert seen["slow"] is True
